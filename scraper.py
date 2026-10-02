@@ -14,23 +14,11 @@ HEADERS = {
 }
 BASE = "https://steamrip.com"
 
-PROXY_SOURCES = [
-    ("monosans", "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"),
-    ("speedx", "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt"),
-    ("proxyscrape", "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all"),
-]
-
+# Hosts explicitly supported by Hydra Launcher resolvers
 HYDRA_HOSTS = {
     "gofile.io", "gofile.me", "mediafire.com", "mediafire.net",
     "pixeldrain.com", "datanodes.cc", "vikingfile.com", "rootz.io",
-    "buzzheavier.com", "bzzhr.to", "fuckingfast.co", "real-debrid.com",
-    "realdebrid.com", "alldebrid.com", "premiumize.me", "torbox.app", "mega.nz"
-}
-
-SKIP_DOMAINS = {
-    "steamrip.com", "twitter.com", "x.com", "discord.gg", "t.me",
-    "reddit.com", "youtube.com", "facebook.com", "instagram.com",
-    "linkedin.com", "twitch.tv", "tiktok.com"
+    "buzzheavier.com", "fuckingfast.co", "mega.nz"
 }
 
 BACKOFF_LOCK = threading.Lock()
@@ -53,57 +41,6 @@ def wait_if_backed_off():
         if remaining <= 0:
             break
         time.sleep(min(remaining, 1.0))
-
-def load_proxies():
-    all_proxies = []
-    for name, url in PROXY_SOURCES:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=10)
-            if r.status_code != 200:
-                continue
-            proxies = []
-            for line in r.text.splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                m = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+)", line)
-                if m:
-                    ip_port = m.group(1)
-                    if not ip_port.startswith("0.0.0.0"):
-                        proxies.append(f"http://{ip_port}")
-            if proxies:
-                all_proxies.extend(proxies)
-        except Exception:
-            pass
-    return list(dict.fromkeys(all_proxies))
-
-def validate_proxies(proxies, sample_size=200):
-    if not proxies:
-        return []
-    sample = random.sample(proxies, min(sample_size, len(proxies)))
-    alive = []
-    lock = threading.Lock()
-
-    def test(p):
-        s = requests.Session()
-        s.headers.update(HEADERS)
-        s.proxies = {"http": p, "https": p}
-        try:
-            r = s.get(f"{BASE}/", timeout=4)
-            return r.status_code < 500
-        except Exception:
-            return False
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=40) as pool:
-        futures = {pool.submit(test, p): p for p in sample}
-        for fut in concurrent.futures.as_completed(futures):
-            p = futures[fut]
-            if fut.result():
-                with lock:
-                    alive.append(p)
-
-    dead = set(sample) - set(alive)
-    return [p for p in proxies if p not in dead]
 
 def scrape_list():
     s = requests.Session()
@@ -136,34 +73,37 @@ def extract_game(url, soup):
     uris = []
     for a in soup.select("a[href]"):
         href = a["href"].strip()
-        if href.startswith("magnet:"):
-            uris.append(href)
+        
+        # Ignore torrents and magnets for Hydra compatibility
+        if href.startswith("magnet:") or href.lower().endswith(".torrent"):
             continue
 
         full_url = urljoin(url, href)
         parsed = urlparse(full_url)
+        
         if parsed.scheme not in ("http", "https"):
             continue
 
         domain = parsed.netloc.lower()
-        if any(domain == d or domain.endswith("." + d) for d in SKIP_DOMAINS):
-            continue
 
+        # Map shortlink bzzhr.to to buzzheavier.com
         if domain == "bzzhr.to" or domain.endswith(".bzzhr.to"):
             full_url = parsed._replace(netloc="buzzheavier.com").geturl()
             parsed = urlparse(full_url)
             domain = parsed.netloc.lower()
 
-        if parsed.path.lower().endswith(".torrent"):
-            uris.append(full_url)
-            continue
-
+        # Filter strictly for Hydra supported hosts
         if any(domain == h or domain.endswith("." + h) for h in HYDRA_HOSTS):
             uris.append(full_url)
 
-    return {"title": title, "fileSize": size, "uris": list(set(uris)), "uploadDate": date}
+    return {
+        "title": title,
+        "fileSize": size,
+        "uris": list(set(uris)),
+        "uploadDate": date
+    }
 
-def scrape_game(url, proxies, dead_set, lock, backoff_delay=15):
+def scrape_game(url, backoff_delay=15):
     last_err = None
     for attempt in range(4):
         wait_if_backed_off()
@@ -171,14 +111,6 @@ def scrape_game(url, proxies, dead_set, lock, backoff_delay=15):
 
         s = requests.Session()
         s.headers.update(HEADERS)
-        used_proxy = None
-
-        if proxies:
-            with lock:
-                alive = [p for p in proxies if p not in dead_set]
-            if alive:
-                used_proxy = random.choice(alive)
-                s.proxies = {"http": used_proxy, "https": used_proxy}
 
         try:
             r = s.get(url, timeout=12)
@@ -194,9 +126,6 @@ def scrape_game(url, proxies, dead_set, lock, backoff_delay=15):
 
         except Exception as e:
             last_err = e
-            if used_proxy:
-                with lock:
-                    dead_set.add(used_proxy)
             if any(err in str(e) for err in ("10054", "RemoteDisconnected", "Max retries", "Blocked")):
                 handle_backoff(backoff_delay)
             time.sleep((2 ** attempt) + random.uniform(0.2, 0.8))
@@ -206,7 +135,6 @@ def scrape_game(url, proxies, dead_set, lock, backoff_delay=15):
 def main():
     limit = 5000
     workers = 5
-    use_proxies = False
     backoff_delay = 15
 
     if "--limit" in sys.argv:
@@ -215,33 +143,19 @@ def main():
         workers = int(sys.argv[sys.argv.index("--workers") + 1])
     if "--backoff" in sys.argv:
         backoff_delay = int(sys.argv[sys.argv.index("--backoff") + 1])
-    if "--use-proxy" in sys.argv:
-        use_proxies = True
-
-    proxies = []
-    if use_proxies:
-        print("[*] Proxy mode enabled. Loading proxies...")
-        raw = load_proxies()
-        if raw:
-            proxies = validate_proxies(raw)
-
-    if not proxies:
-        print("[*] Running scraper with direct connections...")
 
     print("[*] Fetching games list from SteamRIP...")
     urls = scrape_list()
     target_count = min(limit, len(urls))
     print(f"[+] Found {len(urls)} games. Processing {target_count} pages with {workers} workers...\n")
 
-    dead_set = set()
-    lock = threading.Lock()
     games = []
     failed = 0
     done = 0
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(scrape_game, url, proxies, dead_set, lock, backoff_delay): url
+            pool.submit(scrape_game, url, backoff_delay): url
             for url in urls[:limit]
         }
         for fut in concurrent.futures.as_completed(futures):
@@ -249,7 +163,9 @@ def main():
             url = futures[fut]
             try:
                 g = fut.result()
-                games.append(g)
+                # Only append games that actually have valid Hydra URIs
+                if g["uris"]:
+                    games.append(g)
                 if done % 50 == 0 or done == target_count:
                     print(f"  [{done}/{target_count}] {g['title']} — {len(g['uris'])} links")
             except Exception as e:
@@ -258,12 +174,12 @@ def main():
                     print(f"  SKIP {url}: {str(e)[:80]}")
 
     games.sort(key=lambda x: x["title"].lower())
-    data = {"name": "SteamRip", "downloads": games}
+    data = {"name": "SteamRIP", "downloads": games}
     with open("steamrip.json", "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
     total_links = sum(len(g["uris"]) for g in games)
-    print(f"\n[+] Extraction finished: {len(games)} games scraped, {total_links} total links, {failed} failed.")
+    print(f"\n[+] Extraction finished: {len(games)} valid games scraped, {total_links} total links, {failed} failed.")
 
 if __name__ == "__main__":
     main()
