@@ -4,7 +4,7 @@ on:
   schedule:
     # Runs every 6 hours automatically
     - cron: '0 */6 * * *'
-  workflow_dispatch: # Lets you trigger it manually anytime
+  workflow_dispatch: # Allows manual trigger from GitHub UI
 
 jobs:
   scrape:
@@ -26,7 +26,7 @@ jobs:
 
       - name: Run Scraper
         run: |
-          python steamrip.py --workers 5 --backoff 20
+          python scraper.py --workers 5 --backoff 20
 
       - name: Commit and Push Updated JSON
         run: |
